@@ -1,0 +1,7 @@
+variable_name,name,description
+user_id,User ID,Twitter user id
+status_id,Tweet ID,ID for specific tweet
+search_term,Search Term,Term used to collect this tweet
+text,Tweet Text,Tweet text in status post
+lat,Latitude,Latitude coordinate (if geoenabled)
+lng,Longitude,Longitude coordinate (if geoenabled)

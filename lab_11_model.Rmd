@@ -1,0 +1,224 @@
+---
+title: 'Lab 11 (model): Exploratory Data Analysis'
+author: "Jerid Francom"
+date: "11/16/2021"
+output: 
+  html_document: 
+    toc: yes
+    number_sections: yes
+bibliography: bibliography.bib
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)           # data manipulation
+library(patchwork)           # organize plots
+library(janitor)             # cross tabulations
+library(tidytext)            # text operations
+library(quanteda)            # tokenization and document-frequency matrices
+library(quanteda.textstats)  # descriptive text statistics
+library(quanteda.textmodels) # topic modeling
+library(quanteda.textplots)  # plotting quanteda objects
+
+knitr::opts_chunk$set(echo = FALSE)
+source("functions/functions.R")
+```
+
+# Overview
+
+**Twitter US Regionalisms** dataset. 
+
+Tweets collected from the Twitter API between October 14 to 25, 2021 for the search terms: faucet, spigot, frying pan, skillet, pail, bucket, coke, pop, soda, you guys, y'all, yall.
+
+
+# Tasks
+
+## Orientation
+
+Let's first read in the dataset and look at its structure.
+
+```{r tusr-read-dataset, message=FALSE}
+tusr_df <- 
+  read_csv(file = "data/derived/twitter/tusr_curated.csv") %>% # read dataset
+  mutate(user_id = as.character(user_id), # convert to character
+         status_id = as.character(status_id)) # convert to character
+
+glimpse(tusr_df) # preview
+```
+
+
+Now let's take a look at the data dictionary for this dataset. 
+
+```{r tusr-read-show-data-dictionary}
+read_csv(file = "data/derived/twitter/tusr_curated_data_dictionary.csv") %>% 
+  print_pretty_table(caption = "Data diciontary for the Twitter US regionalisms dataset.")
+```
+
+
+Let's take a look at the column `search_term` to see the number of tweets that were collected for each of the terms.
+
+
+```{r tusr-search-terms}
+tusr_df %>% 
+  tabyl(search_term)
+```
+
+## Preparation
+
+For this exploration, I will focus on the terms "y'all" (and "yall") and "you guys". I will now filter these terms and convert the `search_term` variable to a factor.
+
+```{r typ-data-frame}
+typ_df <- # twitter you plural data frame
+  tusr_df %>% # original data frame
+  filter(search_term %in% c("yall", "you guys")) %>% # only keep you plural search terms
+  mutate(search_term = factor(search_term)) # make search term a factor
+
+glimpse(typ_df) # preview
+```
+
+Let's take a closer look at the number and proportion of tweets for each of our terms.
+
+```{r typ-view-search-term}
+typ_df %>% 
+  tabyl(search_term)
+```
+
+As 
+
+```{r}
+typ_df %>% 
+  tabyl(user_id) %>% 
+  select(tweets_per_user = n) %>% 
+  count(tweets_per_user, name = "count", sort = TRUE) %>% 
+  ggplot(aes(x = tweets_per_user, y = log(count))) +
+  geom_col() +
+  scale_x_continuous(breaks = seq(0, 65, 5)) +
+  labs(x = "Tweets (per user)", y = "Count (log-transformed)")
+```
+
+
+```{r}
+typ_df %>% 
+  group_by(user_id) %>% 
+  summarise(tweet_count = n()) %>% 
+  arrange(desc(tweet_count)) %>% 
+  slice_head(n = 10)
+```
+
+```{r}
+typ_df %>% 
+  filter(user_id == "55858408") %>% 
+  select(user_id, status_id, search_term, text) %>% 
+  slice_head(n = 10)
+```
+```{r}
+typ_df %>% 
+  filter(user_id == "23957179") %>% 
+  select(user_id, status_id, search_term, text) %>% 
+  slice_head(n = 10)
+```
+
+
+```{r}
+typ_corpus <- 
+  typ_df %>% 
+  corpus()
+
+typ_corpus %>% 
+  summary(n = 5)
+```
+
+```{r}
+typ_tokens <- 
+  typ_corpus %>% 
+  tokens(what = "word",
+         remove_punct = TRUE,
+         remove_symbols = TRUE,
+         remove_url = TRUE)
+
+typ_tokens[1]
+```
+
+```{r}
+typ_dfm <- 
+  typ_tokens %>% 
+  dfm()
+
+typ_dfm
+```
+
+## Exploration
+
+Now let's take a look at the most frequent terms for each of our search terms.
+
+```{r}
+typ_dfm %>% 
+  dfm_remove(pattern = c("y'all", "yall", phrase("you guys"))) %>% 
+  dfm_remove(pattern = stopwords("en")) %>%
+  topfeatures(groups = search_term)
+```
+
+To get a better sense of the distribution differences, I will perform a keyness analysis. I will remove the search terms, English stopwords, and Twitter hashtags and direct message symbols.
+
+```{r}
+typ_dfm %>% 
+  dfm_remove(pattern = c("y'all", "yall", phrase("you guys"))) %>% 
+  dfm_remove(pattern = stopwords("en")) %>%
+  dfm_remove(pattern = c("#*", "@*")) %>% 
+  textstat_keyness(target = typ_dfm$search_term == "yall") %>% 
+  textplot_keyness(show_legend = FALSE, n = 25, labelsize = 3) + # plot most contrastive terms
+  labs(x = "Chi-squared statistic",
+      title = "Term keyness", 
+       subtitle = "Y'all versus You guys")
+```
+
+Let's now explore the potential distributions of these terms and the words that are related to them using a Topic Modeling approach. A topic model is a unsupervised learning approach in which terms and the documents are related and grouped into topics according to similar distributions. The number of topics is set by the researcher and can be iteratively explored and qualitatively evaluated. 
+
+Before we run the topic model, we will trim the dfm to ensure that we have the most indicative features. 
+
+```{r}
+typ_dfm_trimmed <- 
+  typ_dfm %>% 
+  dfm_trim(min_termfreq = 0.8, 
+           termfreq_type = "quantile", 
+           max_docfreq = 0.1, 
+           docfreq_type = "prop") %>% 
+  dfm_remove(pattern = c("y'all", "yall", phrase("you guys"))) %>% 
+  dfm_remove(pattern = stopwords("en"))
+```
+
+We now load the seededlda package to get access to the `textmodel_lda()` function to create our topic model. We will set the number of topics (`k = `) to 5.
+
+```{r}
+library(seededlda) # for the Latent Dirichlet allocation algoritm
+
+typ_lda <- textmodel_lda(typ_dfm_trimmed, k = 5) # k set to 5 topics
+```
+
+We can now view the terms associated with each topic.
+
+```{r}
+terms(typ_lda, 10) # top 10 terms for each topic
+```
+
+We can assign the topic labels to the dfm and explore the relationship between the topics and the search terms. 
+
+```{r}
+typ_dfm_trimmed$topic <- topics(typ_lda)
+
+typ_dfm_trimmed %>% 
+  docvars() %>% 
+  tabyl(topic, search_term) %>% 
+  adorn_percentages()
+```
+
+There is much more exploration that could be done. Continue to explore and see what else you can find in this dataset!
+
+
+# Assessment
+
+# References
+
+
+
+
+
