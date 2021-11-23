@@ -1,0 +1,185 @@
+---
+title: 'Twitter: curate and transformed datasets'
+author: "Jerid Francom"
+date: "11/16/2021"
+output: html_document
+---
+
+```{r setup, message=FALSE, tidy=FALSE}
+library(tidyverse)           # data manipulation
+library(patchwork)           # organize plots
+library(janitor)             # cross tabulations
+library(tidytext)            # text operations
+library(quanteda)
+library(lubridate)
+
+source("functions/functions.R") # data_dic_starter()
+```
+
+## Curate data
+
+**Twitter US Regionalisms** dataset. 
+
+Tweets collected from the Twitter API between October 14 to 25, 2021 for the search terms: faucet, spigot, frying pan, skillet, pail, bucket, coke, pop, soda, you guys, y'all, yall.
+
+```{r tusr-read-dataset, message=FALSE}
+tusr <- 
+  read_csv("data/original/tweets_us_regionalisms.csv") %>% # read dataset
+  mutate(user_id = as.character(user_id), # change user_id to character
+         status_id = as.character(status_id)) # change status_id to character
+
+glimpse(tusr) # preview variables
+```
+
+Let's remove the tweets that are not classified as English (`en`) and select only the key variables for this analysis.
+
+```{r tusr-en-variables}
+# 1. Filter English only tweets and keep needed columns
+tusr_en <- 
+  tusr %>% # original data frame
+  filter(lang == "en") %>% # only English tweets (according to Twitter)
+  select(user_id, status_id, friends_count, followers_count, statuses_count, account_created_at, text, search_term, lat, lng) # key variables
+
+glimpse(tusr_en) # preview variables
+```
+
+After applying the language filter `r (1 - nrow(tusr_en)/nrow(tusr)) * 100`\% of the observations were removed (from `r nrow(tusr)` to `r nrow(tusr_en)` observations).
+
+Next get friends to followers ratio and get tge age if the account in weeks.
+
+```{r tusr-en-friends-followers}
+# 2. Get statuses_count, friends_to_followers, account_age_weeks
+
+tusr_en_friends_statuses <- 
+  tusr_en %>% # data frame
+  distinct(user_id, friends_count, followers_count, statuses_count, account_created_at) %>% # get distinct user information
+  mutate(friends_to_followers = (friends_count + .1) / (followers_count + .1), # get friends to followers ratio (add .1 for smoothing)
+         account_age_weeks = interval(account_created_at, today())/ weeks(1)) %>% # calculate the age of the account in weeks
+  select(user_id, statuses_count, friends_to_followers, account_age_weeks) # select the key variables
+
+glimpse(tusr_en_friends_statuses) # previeew
+```
+
+Now group each user in the dataset and collapse the `text` into one observation counting the number of tweets for each user. Then get the number of types, tokens, and the TTR for each user. Use the `tweet_count` to adjust the TTR scores.
+
+```{r tusr-en-ttr}
+# 3. Get TTR --user_id
+tusr_en_ttr <- 
+  tusr_en %>% 
+  group_by(user_id) %>% # grouping parameter
+  summarise(tweets = str_flatten(text, collapse = " "), # collapse all the text
+            tweet_count = n()) %>% # count the number of tweets
+  ungroup() %>% # remove grouping
+  unnest_tokens(word, tweets, token = "tweets") %>% # tokenize tweets by words
+  group_by(user_id) %>% # grouping parameter
+  mutate(types = n_distinct(word), # get number of types
+         tokens = n(), # get number of tokens
+         ttr = round(types/tokens, 3)) %>% # calculate TTR
+  ungroup() %>% # remove grouping
+  group_by(tweet_count) %>% # grouping parameter
+  mutate(adj_ttr = ttr - mean(ttr)) %>% # adjust ttr by the mean ttr for the given tweet count
+  ungroup() %>% # remove grouping
+  distinct(user_id, tweet_count, types, tokens, ttr, adj_ttr) # keep distinct user information
+
+glimpse(tusr_en_ttr) # preview
+```
+
+Now explore the measures that appear to distinguish between legitimate and spam tweets. 
+
+```{r tusr-en-measures}
+# Consider a system of weights
+# - Join tusr_en_friends_statuses and tusr_en_ttr
+tusr_measures <- left_join(tusr_en_ttr, tusr_en_friends_statuses)
+
+p1 <- 
+  tusr_measures %>% 
+  ggplot(aes(y = adj_ttr)) +
+  geom_boxplot()
+
+p2 <- 
+  tusr_measures %>% 
+  ggplot(aes(y = friends_to_followers)) +
+  geom_boxplot() +
+  scale_y_continuous(limits = c(0, 7))
+
+p1 + p2
+```
+
+
+From these plots it looks like the `adj_ttr` and `friends_to_followers` can be used to filter the dataset --keeping higher TTR and removing higher friends to followers.
+
+```{r tusr-en-filter}
+ttr_low <- # lowest lexical diversity allowed
+  as.numeric(quantile(tusr_measures$adj_ttr)[2]) - (IQR(tusr_measures$adj_ttr) * 1.5) # 1st quantile minus the IQR x 1.5
+
+ttr_low # view
+
+friends_to_followers_high <- # highest friends to followers allowed
+  as.numeric(quantile(tusr_measures$friends_to_followers)[2]) + (IQR(tusr_measures$friends_to_followers) * 1.5) # 1st quantile plus the IQR x 1.5
+
+friends_to_followers_high # view
+
+tusr_measures_filtered <- 
+  tusr_measures %>% 
+  filter(adj_ttr > ttr_low & friends_to_followers < friends_to_followers_high) %>%  # keep higher TTR/ keep lower friends to followers ratio
+  select(-statuses_count) # remove variable
+
+tusr_selected_users <- 
+  tusr_measures_filtered %>% 
+  distinct(user_id)
+
+tusr <- 
+  right_join(tusr_en, tusr_selected_users) # keep all observations in `tusr_en` with user_id matches in `tusr_measures_filtered`
+
+glimpse(tusr) # preview
+```
+
+The combined and filtered dataset contains `r nrow(tusr)` observations. 
+
+```{r tusr-user-preview}
+tusr %>% 
+  filter(user_id == "17402123") %>% 
+  select(search_term, text) %>% 
+  slice_head(n = 20)
+```
+
+It looks like the `search_terms()` function from rtweet pulls users that have used the term search, not tweets as there are tweets that do not contain the search term, but a least one of the tweets from a user does. This is not the behavior I expected. 
+
+Let's combine the `yall` and `y'all` search terms into `yall`. 
+
+```{r tusr-combine-yall}
+tusr <- 
+  tusr %>% 
+  mutate(search_term = str_replace(search_term, "y'all", "yall"))
+```
+
+Remove curation-oriented variables.
+
+```{r tusr-curated-columns}
+tusr_curated <- 
+  tusr %>% 
+  select(user_id, status_id, search_term, text, lat, lng)
+```
+
+Write dataset to disk.
+
+```{r tusr-write}
+fs::dir_create(path = "data/derived/twitter/")
+write_csv(tusr_curated, file = "data/derived/twitter/tusr_curated.csv")
+```
+
+```{r tusr-document, eval=FALSE}
+data_dic_starter <- function(data, file_path) {
+  # Function:
+  # Creates a .csv file with the basic information
+  # to document a curated dataset
+
+  tibble(variable_name = names(data), # column with existing variable names
+         name = "", # column for human-readable names
+         description = "") %>% # column for prose description
+    write_csv(file = file_path) # write to disk
+}
+
+data_dic_starter(tusr_curated, file_path = "data/derived/twitter/tusr_curated_data_dictionary.csv")
+```
+
